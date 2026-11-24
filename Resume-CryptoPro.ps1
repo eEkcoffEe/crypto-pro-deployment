@@ -22,8 +22,9 @@ try {
         exit 0
     }
     if ($Phase -eq 'AwaitCleanup') { Add-Content $Log 'Waiting for interactive cleanup.'; exit 0 }
-    Disable-ScheduledTask -TaskName $TaskName | Out-Null
+    Add-Content $Log "$(Get-Date -Format o) Phase: $Phase"
     if ($Phase -eq 'Install') {
+        Add-Content $Log "$(Get-Date -Format o) Starting installation"
         & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -File (Join-Path $PSScriptRoot 'Install-CryptoPro.ps1') -InstallerPath (Join-Path $PSScriptRoot 'CryptoPro-5.0.13820.exe') *>> $Log
         $Code = $LASTEXITCODE
         if ($Code -notin @(0,3010)) { throw "Installation failed: $Code" }
@@ -41,4 +42,4 @@ try {
     Set-Content -LiteralPath $PhaseFile -Value 'Done' -Encoding ASCII
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     Add-Content $Log 'Completed. Verify license manually.'
-} catch { Add-Content $Log ($_ | Out-String); Write-Error $_; exit 1 }
+} catch { Add-Content $Log ($_ | Format-List * -Force | Out-String); Write-Error $_; exit 1 }

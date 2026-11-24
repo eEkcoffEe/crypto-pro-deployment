@@ -45,15 +45,63 @@ try {
         $Args = '-gm2 -silent -norestart -noyandex -lang rus -kc kc1'
         if ($Repair) { $Args += ' -reinstall' }
         $Args += ' -args "/qn /norestart /L*v ' + $CspLog + '" -cadesargs "/qn /norestart /L*v ' + $PluginLog + '"'
-        $P = Start-Process -FilePath $Local -ArgumentList $Args -Wait -PassThru
-        Write-Host "Installer exit code: $($P.ExitCode)"
+        function Wait-InstallReady {
+            $Clock = [System.Diagnostics.Stopwatch]::StartNew()
+            $FreeSince = $null
+            do {
+                $Reasons = @()
+                try {
+                    $MsiMutex = [System.Threading.Mutex]::OpenExisting('Global\_MSIExecute')
+                    try {
+                        try { $Acquired = $MsiMutex.WaitOne(0) }
+                        catch [System.Threading.AbandonedMutexException] { $Acquired = $true }
+                        if ($Acquired) { $MsiMutex.ReleaseMutex() } else { $Reasons += 'MSI execution mutex busy' }
+                    } finally { $MsiMutex.Dispose() }
+                } catch [System.Threading.WaitHandleCannotBeOpenedException] {} catch { $Reasons += "MSI mutex check failed: $_" }
+                foreach ($Name in @('RpcSs','DcomLaunch','RpcEptMapper','gpsvc')) {
+                    if ((Get-Service -Name $Name).Status -ne 'Running') { $Reasons += "Service $Name not running" }
+                }
+                $Processes = @(Get-CimInstance Win32_Process)
+                foreach ($Proc in $Processes) {
+                    if ($Proc.Name -match '^(CryptoPro.*\.exe|cspclean\.exe|gpupdate\.exe|setup\.exe)$' -or
+                        ($Proc.Name -eq 'msiexec.exe' -and $Proc.CommandLine -match '(?i)(?:^|\s)[/-](?:i|x|package|uninstall|update|p|f\w*)(?:\s|\{|"|$)')) {
+                        $Reasons += "Process $($Proc.Name) PID $($Proc.ProcessId)"
+                    }
+                }
+                if ($Reasons.Count) {
+                    $FreeSince = $null
+                    Write-Host "$(Get-Date -Format o) Waiting: $($Reasons -join '; ')"
+                } else {
+                    if ($null -eq $FreeSince) { $FreeSince = $Clock.Elapsed.TotalSeconds }
+                    if (($Clock.Elapsed.TotalSeconds - $FreeSince) -ge 15) {
+                        Write-Host "$(Get-Date -Format o) Readiness checks clear for 15 seconds."
+                        return
+                    }
+                }
+                Start-Sleep -Seconds 5
+            } while ($Clock.Elapsed.TotalSeconds -lt 900)
+            throw 'Readiness timeout (15 minutes). No installer launched.'
+        }
+        for ($Attempt = 1; $Attempt -le 3; $Attempt++) {
+            Wait-InstallReady
+            Write-Host "$(Get-Date -Format o) Launching installer: $Local (attempt $Attempt)"
+            $P = Start-Process -FilePath $Local -ArgumentList $Args -PassThru
+            Write-Host "$(Get-Date -Format o) Installer PID: $($P.Id)"
+            if (-not $P.WaitForExit(900000)) {
+                throw "Installer timeout (15 minutes), PID $($P.Id). Inspect processes and logs before retrying; installer was not terminated."
+            }
+            $P.Refresh()
+            Write-Host "Installer exit code: $($P.ExitCode)"
+            if ($P.ExitCode -ne 1618 -or $Attempt -eq 3) { break }
+            Write-Host 'MSI conflict (1618); repeating readiness checks.'
+        }
         if ($P.ExitCode -notin @(0,3010,1641)) { throw "Installer failed: $($P.ExitCode)" }
         $After = @(Get-Products)
         if (-not @($After | Where-Object { $_.DisplayName -match ' CSP$' -and $_.DisplayVersion -eq "$Target" }).Count -or -not @($After | Where-Object { $_.DisplayName -match 'Browser plug-in$' -and $_.DisplayVersion -eq "$PluginTarget" }).Count) { throw 'Expected versions not detected after installation.' }
         $Code = $P.ExitCode
         Write-Host 'Installation completed. Verify CSP and license after a planned reboot.'
     }
-} catch { Write-Host $_ -ForegroundColor Red; $Code = 1 }
+} catch { Write-Host ($_ | Format-List * -Force | Out-String) -ForegroundColor Red; $Code = 1 }
 finally {
     try { Stop-Transcript | Out-Null } catch {}
     if ($Locked) { $Mutex.ReleaseMutex() }
