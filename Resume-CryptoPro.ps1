@@ -18,7 +18,7 @@ try {
         if ($P.ExitCode -notin @(0,3010)) { throw 'Cleanup failed; inspect manually.' }
         if ((Read-Host 'Confirm successful cleanup with keys preserved (YES)') -cne 'YES') { throw 'Cleanup not confirmed.' }
         Set-Content -LiteralPath $PhaseFile -Value 'Install' -Encoding ASCII
-        Restart-Computer
+        Restart-Computer -Force
         exit 0
     }
     if ($Phase -eq 'AwaitCleanup') { Add-Content $Log 'Waiting for interactive cleanup.'; exit 0 }
@@ -29,7 +29,7 @@ try {
         if ($Code -notin @(0,3010)) { throw "Installation failed: $Code" }
         Set-Content -LiteralPath $PhaseFile -Value 'Verify' -Encoding ASCII
         Enable-ScheduledTask -TaskName $TaskName | Out-Null
-        Restart-Computer
+        Restart-Computer -Force
         exit 0
     }
     if ($Phase -ne 'Verify') { throw 'Unexpected phase.' }

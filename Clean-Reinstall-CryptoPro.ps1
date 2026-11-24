@@ -94,5 +94,5 @@ finally {
     if ($Locked) { $Mutex.ReleaseMutex() }
     $Mutex.Dispose()
 }
-if ($Code -eq 3010 -and $Restart) { Restart-Computer }
+if ($Code -eq 3010 -and $Restart) { Restart-Computer -Force }
 exit $Code

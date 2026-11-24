@@ -59,5 +59,5 @@ finally {
     if ($Locked) { $Mutex.ReleaseMutex() }
     $Mutex.Dispose()
 }
-if ($Restart -and $Code -in @(0,3010)) { Restart-Computer }
+if ($Restart -and $Code -in @(0,3010)) { Restart-Computer -Force }
 exit $Code
