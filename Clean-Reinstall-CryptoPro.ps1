@@ -3,9 +3,11 @@
 [CmdletBinding()]
 param(
     [string]$InstallerPath = '\\vfs01\soft\Programs\crypto pro\CryptoPro-5.0.13820.exe',
-    [switch]$Force, [switch]$Restart
+    [string]$CleanerPath = (Join-Path $PSScriptRoot 'Installers\cspclean.exe'),
+    [switch]$Force, [switch]$Restart, [switch]$KeysBackedUp
 )
 $ErrorActionPreference = 'Stop'
+if (-not $KeysBackedUp) { throw 'Confirm verified external key backups with -KeysBackedUp.' }
 if (-not $Force) { throw 'Explicit -Force required. Back up keys and certificates before proceeding.' }
 if (-not [Environment]::Is64BitProcess) { throw 'Use x64 PowerShell.' }
 $Root = Join-Path $env:ProgramData 'CryptoProDeployment'
@@ -13,6 +15,8 @@ $Logs = Join-Path $Root 'Logs'
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
 $Backup = Join-Path $Root "Backup-$Stamp"
 $Code = 1
+$TaskName = 'CryptoProDeployment-Resume'
+$Stage = Join-Path $Root "Resume-$Stamp"
 $Mutex = New-Object System.Threading.Mutex($false,'Global\CryptoProDeployment')
 $Locked = $false
 $Transcript = $false
@@ -33,6 +37,11 @@ try {
     $Transcript = $true
     $Bundled = Join-Path $PSScriptRoot 'Installers\CryptoPro-5.0.13820.exe'
     if (-not $PSBoundParameters.ContainsKey('InstallerPath') -and (Test-Path -LiteralPath $Bundled)) { $InstallerPath = $Bundled }
+    $Cleaner = Get-Item -LiteralPath $CleanerPath
+    $CleanerSig = Get-AuthenticodeSignature -FilePath $Cleaner.FullName
+    if ($CleanerSig.Status -ne 'Valid' -or $CleanerSig.SignerCertificate.Subject -notmatch 'Crypto.?Pro|Крипто.?Про') { throw 'Cleaner signature or publisher check failed.' }
+    $Other = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'КриптоПро|Crypto.?Pro|КриптоАРМ|CryptoARM' -and $_.DisplayName -notmatch '^(КриптоПро CSP|CryptoPro CSP|Crypto-Pro CSP|КриптоПро ЭЦП Browser plug-in|CryptoPro.*Browser plug-in)$' })
+    if ($Other.Count) { throw ('Other crypto products detected: ' + ($Other.DisplayName -join ', ')) }
     $Local = Join-Path $Root 'CryptoPro-5.0.13820.exe'
     if ((Resolve-Path -LiteralPath $InstallerPath).Path -ne $Local) { Copy-Item -LiteralPath $InstallerPath -Destination $Local -Force }
     $Sig = Get-AuthenticodeSignature -FilePath $Local
@@ -51,28 +60,39 @@ try {
             if ($LASTEXITCODE -ne 0) { throw 'Registry backup failed.' }
         }
     }
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) { throw 'A previous continuation task exists. Inspect its status before retrying.' }
+    New-Item -ItemType Directory -Path $Stage -Force | Out-Null
+    Set-Acl -Path $Stage -AclObject (Get-Acl $Backup)
+    Copy-Item -LiteralPath $Local -Destination (Join-Path $Stage 'CryptoPro-5.0.13820.exe')
+    Copy-Item -LiteralPath $Cleaner.FullName -Destination (Join-Path $Stage 'cspclean.exe')
+    Unblock-File -LiteralPath (Join-Path $Stage 'cspclean.exe')
+    foreach ($Name in @('Install-CryptoPro.ps1','Resume-CryptoPro.ps1')) {
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot $Name) -Destination $Stage
+        Unblock-File -LiteralPath (Join-Path $Stage $Name)
+    }
+    if ($Restart) { New-Item -ItemType File -Path (Join-Path $Stage 'FinalRestart.flag') | Out-Null }
     # Use only MSI-managed removal. No manual vendor registry or key deletion.
     $NeedsRestart = $false
     foreach ($Product in ($Products | Sort-Object @{Expression={if ($_.DisplayName -match 'Browser plug-in$') {0} else {1}}})) {
         $Log = Join-Path $Logs "$Stamp-remove-$($Product.PSChildName).log"
         $Process = Start-Process msiexec.exe -ArgumentList "/x $($Product.PSChildName) /qn /norestart /L*v `"$Log`"" -Wait -PassThru
         if ($Process.ExitCode -eq 3010) { $NeedsRestart = $true }
-        elseif ($Process.ExitCode -eq 1641) { $Code = 1641; break }
+        elseif ($Process.ExitCode -eq 1641) { throw 'Unexpected installer-initiated reboot (1641); inspect logs and install manually.' }
         elseif ($Process.ExitCode -notin @(0,1605)) { throw "Uninstall failed: $($Process.ExitCode)" }
     }
-    if ($Code -ne 1641) {
-        if ($NeedsRestart) { $Code = 3010; Write-Warning 'Removal requires reboot. After reboot run Install-CryptoPro.ps1, not Clean again.' }
-        else { $Code = 0 }
-    }
+    $Action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument ('-NoProfile -NonInteractive -File "' + (Join-Path $Stage 'Resume-CryptoPro.ps1') + '"')
+    $Trigger = New-ScheduledTaskTrigger -AtStartup
+    $Principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    Set-Content -LiteralPath (Join-Path $Stage 'phase.txt') -Value 'AwaitCleanup' -Encoding ASCII
+    Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -ErrorAction Stop | Out-Null
+    $Code = 3010
+    Write-Warning 'Reboot required. After reboot run the cleanup command printed below in an elevated interactive PowerShell.'
+    Write-Host ("& '" + (Join-Path $Stage 'Resume-CryptoPro.ps1') + "' -Cleanup")
 } catch { Write-Host $_ -ForegroundColor Red; $Code = 1 }
 finally {
     if ($Transcript) { Stop-Transcript | Out-Null }
     if ($Locked) { $Mutex.ReleaseMutex() }
     $Mutex.Dispose()
-}
-if ($Code -eq 0) {
-    & (Join-Path $PSScriptRoot 'Install-CryptoPro.ps1') -InstallerPath $Local -Restart:$Restart
-    exit $LASTEXITCODE
 }
 if ($Code -eq 3010 -and $Restart) { Restart-Computer }
 exit $Code
